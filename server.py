@@ -19,7 +19,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -130,13 +132,36 @@ class MeerkatClient:
 
 
 def _err_text(r: httpx.Response) -> str:
+    """Meerkat errors look like {"error": {"code", "message", "details": {...}}}.
+    The details name the offending field, so keep them."""
     try:
         b = r.json()
-        if isinstance(b, dict) and ("message" in b or "code" in b):
-            return f"{b.get('code', '')} {b.get('message', '')}".strip()
     except ValueError:
-        pass
-    return r.text[:300]
+        return r.text[:500]
+    if isinstance(b, dict):
+        e = b.get("error") if isinstance(b.get("error"), dict) else b
+        if isinstance(e, dict) and ("message" in e or "code" in e):
+            text = f"{e.get('code', '')} {e.get('message', '')}".strip()
+            if e.get("details"):
+                text += " | details: " + json.dumps(e["details"], ensure_ascii=False)
+            return text[:800]
+    return r.text[:500]
+
+
+def _rfc3339(value: str) -> str:
+    """Meerkat parses dates as RFC3339 and rejects bare YYYY-MM-DD."""
+    v = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        return v + "T00:00:00Z"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?", v):
+        if len(v) == 16:
+            v += ":00"
+        return v + "Z"
+    return v
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 _client: MeerkatClient | None = None
@@ -296,16 +321,32 @@ async def list_activities(
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> str:
-    """Activities (meetings, calls, dinners). Per contact, or across everyone with optional search/date range."""
-    if contact_id is not None:
-        data = await client().request("GET", f"/contacts/{contact_id}/activities")
-    else:
-        data = await client().request(
-            "GET",
-            "/activities",
-            params={"search": search, "date_from": date_from, "date_to": date_to},
-        )
-    return _out(data)
+    """Activities (meetings, calls, dinners). Per contact, or across everyone. `search` is matched by Meerkat;
+    `date_from` / `date_to` (YYYY-MM-DD, inclusive) are applied here, because Meerkat's own date parameters
+    aren't known. Results include linked contacts for the per-contact view."""
+    path = f"/contacts/{contact_id}/activities" if contact_id is not None else "/activities"
+    items: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    for page in range(1, 21):
+        data = await client().request("GET", path, params={"search": search, "page": page, "limit": 100})
+        batch = _unwrap(data, "activities")
+        if not isinstance(batch, list) or not batch:
+            break
+        size = data.get("limit") if isinstance(data, dict) and data.get("limit") else 100
+        fresh = [a for a in batch if isinstance(a, dict) and a.get("ID") not in seen]
+        if not fresh:  # endpoint ignores paging and repeated itself
+            break
+        seen.update(a.get("ID") for a in fresh)
+        items.extend(fresh)
+        if len(batch) < size:
+            break
+    lo = date_from[:10] if date_from else None
+    hi = date_to[:10] if date_to else None
+    items = [
+        a for a in items
+        if (not lo or str(a.get("date", ""))[:10] >= lo) and (not hi or str(a.get("date", ""))[:10] <= hi)
+    ]
+    return _out({"activities": items, "count": len(items)})
 
 
 @mcp.tool(annotations=RO)
@@ -334,8 +375,23 @@ async def reminder_history(contact_id: int) -> str:
 
 @mcp.tool(annotations=RO)
 async def network_graph() -> str:
-    """Contact network graph data (nodes and links from relationships and shared activities)."""
-    return _out(await client().request("GET", "/graph"))
+    """Compact summary of the contact network: relationships as 'A --Type--> B' and which contacts shared
+    each activity. (Meerkat's raw graph is ~250 nodes, so this returns names, not node lists.)"""
+    data = await client().request("GET", "/graph")
+    nodes = {n.get("id"): n for n in data.get("nodes", [])} if isinstance(data, dict) else {}
+
+    def label(i: Any) -> str:
+        return str(nodes.get(i, {}).get("label", i))
+
+    relationships: list[str] = []
+    activities: dict[str, list[str]] = {}
+    for e in data.get("edges", []) if isinstance(data, dict) else []:
+        if e.get("type") == "relationship":
+            relationships.append(f"{label(e.get('source'))} --{e.get('label', '')}--> {label(e.get('target'))}")
+        elif e.get("type") == "activity":
+            activities.setdefault(label(e.get("source")), []).append(label(e.get("target")))
+    contact_count = sum(1 for n in nodes.values() if n.get("type") == "contact")
+    return _out({"contacts": contact_count, "relationships": relationships, "activities": activities})
 
 
 # ---- writes ----------------------------------------------------------------------
@@ -368,20 +424,26 @@ async def create_relationship(
     contact_id: int, related_contact_id: int, relationship_type: str
 ) -> str:
     """Link two contacts, e.g. contact 3 --'Sister'--> contact 9 (shown as 'Sister: <name>')."""
+    # In Meerkat's data, `name` is the related person's name and `type` is the relationship
+    # ("Spouse"), so look the person up rather than guessing.
+    other = _unwrap(await client().request("GET", f"/contacts/{related_contact_id}"), "contact")
+    name = " ".join(
+        p for p in (other.get("firstname"), other.get("lastname")) if p
+    ) if isinstance(other, dict) else ""
     body = {
+        "contact_id": contact_id,
         "related_contact_id": related_contact_id,
         "type": relationship_type,
-        "name": relationship_type,
+        "name": name,
     }
     return _out(await client().request("POST", f"/contacts/{contact_id}/relationships", json_body=body))
 
 
 @write_tool()
 async def add_note(content: str, contact_id: int | None = None, date: str | None = None) -> str:
-    """Add a note to a contact's timeline, or a general journal note if contact_id is omitted."""
-    body: dict[str, Any] = {"content": content}
-    if date:
-        body["date"] = date
+    """Add a note to a contact's timeline, or a general journal note if contact_id is omitted.
+    `date` defaults to now (Meerkat requires one); date-only values are accepted."""
+    body: dict[str, Any] = {"content": content, "date": _rfc3339(date) if date else _now()}
     path = f"/contacts/{contact_id}/notes" if contact_id is not None else "/notes"
     return _out(await client().request("POST", path, json_body=body))
 
@@ -403,7 +465,7 @@ async def log_activity(
     """Log an activity (dinner, call, meeting) with one or more contacts. Two or more contacts puts it on the network graph."""
     body: dict[str, Any] = {
         "title": title,
-        "date": date,
+        "date": _rfc3339(date),
         "contact_ids": contact_ids,
     }
     if description:
@@ -428,11 +490,16 @@ async def create_reminder(
     by_mail: bool | None = None,
     reoccur_from_completion: bool | None = None,
 ) -> str:
-    """Create a reminder for a contact. `remind_at` is an ISO timestamp. `recurrence` e.g. 'weekly', 'monthly'
-    (omit for one-off). `reoccur_from_completion` reschedules from the day it is completed rather than the due date."""
-    body: dict[str, Any] = {"message": message, "remind_at": remind_at}
-    if recurrence:
-        body["recurrence"] = recurrence
+    """Create a reminder for a contact. `remind_at` is an ISO timestamp (date-only is accepted).
+    `recurrence` e.g. 'weekly', 'monthly'; Meerkat requires a value, so one-off reminders send 'once'
+    (if Meerkat rejects that, the error names the allowed values). `reoccur_from_completion` reschedules
+    from the day it is completed rather than the due date."""
+    body: dict[str, Any] = {
+        "contact_id": contact_id,  # Meerkat requires it in the body as well as the path
+        "message": message,
+        "remind_at": _rfc3339(remind_at),
+        "recurrence": recurrence or "once",
+    }
     if by_mail is not None:
         body["by_mail"] = by_mail
     if reoccur_from_completion is not None:
