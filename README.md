@@ -43,18 +43,30 @@ Update tools read the record first and merge your changes into it, so a partial 
 
 ## What is and isn't verified
 
-Tested end-to-end (`python tests/test_e2e.py`) against a **mock** Meerkat API using a real MCP client over
-Streamable HTTP: auth modes, re-login, read-only and delete gating, error surfacing, non-localhost Host header.
+Automated: `python tests/test_e2e.py` runs the server against a **mock** Meerkat API with a real MCP client over
+Streamable HTTP (auth modes, re-login, read-only and delete gating, error parsing, and regression tests for the
+Meerkat quirks below).
 
-Not tested against a real Meerkat instance. Endpoints come from Meerkat's published API reference, but it
-doesn't document request bodies, so these are best guesses to check on first use:
+Live-tested against a real Meerkat (v1.5-style data model, behind a reverse proxy):
 
-- Query params on `GET /contacts` (`search`, `circle`, `archived`, `page`, `limit`) and `GET /activities`
-  (`search`, `date_from`, `date_to`).
-- Body field names for activities (`contact_ids`), reminders (`remind_at`, `by_mail`, `recurrence`,
-  `reoccur_from_completion`), notes (`content`) and relationships (`related_contact_id`, `type`).
-- Contact fields are passed through as a free-form `fields` object, so `get_contact` on an existing
-  record shows the exact names for your Meerkat version (v1.5 added multi-value fields like `emails`).
-- Whether API tokens are accepted as Bearer on your version.
+- Working: `get_current_user`, `list_contacts` (paging, `search`, `circle`), `list_circles`, `upcoming_birthdays`,
+  `random_contacts`, `list_reminders` (upcoming), `list_notes`, `list_activities` (all, per contact, `search`),
+  `list_relationships`, `network_graph`, `update_contact` (partial update preserves other fields),
+  `add_note`, `update_note`, `log_activity`, `update_activity` (linked contacts preserved),
+  `set_contact_archived` (archive and unarchive).
+- Meerkat quirks the server now handles: dates must be RFC3339 (bare `YYYY-MM-DD` is converted); notes require a date
+  (defaults to now); reminders require `contact_id` in the body and a `recurrence`; relationships store the related
+  person's *name* in `name` and the relationship in `type`; errors are nested under `"error"` with the bad field in
+  `details`.
+- Activity date filtering is done in the server (Meerkat's own parameter names for it aren't known), so
+  `date_from` / `date_to` work but fetch all activities first.
+- `list_activities` with `search` reports an inflated `total` from Meerkat (it counts joined rows); the server
+  returns its own `count`.
 
-Wrong guesses show up as a clear `VALIDATION_ERROR` from Meerkat, and are a one-line fix in `server.py`.
+Still unverified against a real instance after the fixes: `create_reminder` (one-off reminders send
+`recurrence: "once"`, which is a guess - if Meerkat rejects it the error will list the allowed values),
+`update_reminder`, `complete_reminder`, `reminder_history`, `create_relationship`, `create_contact`, and the
+`delete_*` tools.
+
+If you see intermittent `403 Forbidden` on the MCP call itself (the message says the POST to the endpoint was blocked),
+that is coming from a proxy/firewall in front of the MCP server, not from this code. Retrying works.
