@@ -1,0 +1,47 @@
+# Obot MCP server definition (containerized runtime).
+# Use as a starting point: in Obot go to MCP Servers -> Add -> Containerized,
+# or add this as a catalog entry. Field names follow the obot-platform/mcp-catalog
+# format as I understand it - check against a current example in that repo.
+name: Meerkat CRM
+shortDescription: Contacts, notes, activities, reminders and birthdays from your self-hosted Meerkat CRM
+description: >-
+  Search and manage your self-hosted Meerkat CRM from an agent: look up people,
+  log activities, add notes, set and complete reminders, check upcoming birthdays.
+  Set MEERKAT_READ_ONLY=true for a read-only server. Deletes are disabled unless
+  MEERKAT_ALLOW_DELETE=true.
+runtime: containerized
+containerizedConfig:
+  image: ghcr.io/YOUR_ORG/meerkat-mcp:0.1.0   # publish publicly; Obot's Docker runtime pulls without auth
+  port: 8080
+  path: /mcp
+env:
+  - name: Meerkat URL
+    key: MEERKAT_URL
+    description: Base URL of your Meerkat instance, reachable from the Obot host (e.g. http://meerkat:8080 or https://crm.example.com)
+    sensitive: false
+    required: true
+  - name: Meerkat API token
+    key: MEERKAT_API_TOKEN
+    description: API token created in Meerkat. Leave blank to use username/password instead.
+    sensitive: true
+    required: false
+  - name: Meerkat username
+    key: MEERKAT_USERNAME
+    description: Only needed if no API token is set
+    sensitive: false
+    required: false
+  - name: Meerkat password
+    key: MEERKAT_PASSWORD
+    description: Only needed if no API token is set
+    sensitive: true
+    required: false
+  - name: Read-only
+    key: MEERKAT_READ_ONLY
+    description: "true = expose read tools only"
+    sensitive: false
+    required: false
+  - name: Allow deletes
+    key: MEERKAT_ALLOW_DELETE
+    description: "true = also expose delete_contact / delete_note / delete_activity / delete_reminder"
+    sensitive: false
+    required: false
