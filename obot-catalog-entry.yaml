@@ -11,7 +11,7 @@ description: >-
   MEERKAT_ALLOW_DELETE=true.
 runtime: containerized
 containerizedConfig:
-  image: ghcr.io/YOUR_ORG/meerkat-mcp:0.1.0   # publish publicly; Obot's Docker runtime pulls without auth
+  image: ghcr.io/rossdargan/meerkat-crm-mcp:latest
   port: 8080
   path: /mcp
 env:
