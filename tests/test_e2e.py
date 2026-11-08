@@ -4,6 +4,7 @@ Run:  python tests/test_e2e.py
 """
 import asyncio
 import json
+import re
 import os
 import subprocess
 import sys
@@ -35,7 +36,9 @@ def authed(req: Request) -> bool:
 
 
 def err(code, status, msg):
-    return JSONResponse({"code": code, "message": msg, "details": {}}, status_code=status)
+    # Real Meerkat nests errors under "error" and puts the offending field in details
+    return JSONResponse({"error": {"code": code, "message": msg, "details": {"Date": "Date is required"}}},
+                        status_code=status)
 
 
 async def login(req: Request):
@@ -81,6 +84,56 @@ async def contact(req: Request):
     return JSONResponse(STATE["contacts"][cid])
 
 
+RFC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+BODIES = {}
+
+
+async def post_note(req):
+    if not authed(req):
+        return err("UNAUTHORIZED", 401, "no")
+    b = await req.json()
+    if not RFC.match(b.get("date", "")):
+        return err("VALIDATION_ERROR", 400, "Request validation failed")
+    BODIES["note"] = b
+    return JSONResponse({"message": "ok", "note": {"ID": 1, **b}}, status_code=201)
+
+
+async def post_reminder(req):
+    b = await req.json()
+    if not b.get("contact_id") or not b.get("recurrence") or not RFC.match(b.get("remind_at", "")):
+        return err("VALIDATION_ERROR", 400, "Request validation failed")
+    BODIES["reminder"] = b
+    return JSONResponse({"reminder": b}, status_code=201)
+
+
+async def activities(req):
+    if req.method == "POST":
+        b = await req.json()
+        if not RFC.match(b.get("date", "")):
+            return err("INVALID_INPUT", 400, "parsing time")
+        BODIES["activity"] = b
+        return JSONResponse({"activity": b}, status_code=201)
+    acts = [{"ID": 1, "title": "a", "date": "2026-03-28T19:00:00Z"},
+            {"ID": 2, "title": "b", "date": "2026-07-16T00:00:00Z"},
+            {"ID": 3, "title": "c", "date": "2026-11-02T00:00:00Z"}]
+    return JSONResponse({"activities": acts, "limit": 25, "page": 1, "total": 3})
+
+
+async def post_rel(req):
+    b = await req.json()
+    BODIES["rel"] = b
+    return JSONResponse(b, status_code=201)
+
+
+async def graph(_):
+    return JSONResponse({
+        "nodes": [{"id": "c-1", "type": "contact", "label": "Eva Smith"},
+                  {"id": "c-2", "type": "contact", "label": "Zed"},
+                  {"id": "a-1", "type": "activity", "label": "Dinner"}],
+        "edges": [{"id": "r-1", "source": "c-1", "target": "c-2", "type": "relationship", "label": "Spouse"},
+                  {"id": "ae-1", "source": "a-1", "target": "c-1", "type": "activity", "label": "Dinner"}]})
+
+
 async def health(_):
     return JSONResponse({"status": "ok"})
 
@@ -90,6 +143,11 @@ mock = Starlette(routes=[
     Route("/api/v1/users/me", me),
     Route("/api/v1/contacts", contacts, methods=["GET", "POST"]),
     Route("/api/v1/contacts/{id:int}", contact, methods=["GET", "PUT", "DELETE"]),
+    Route("/api/v1/contacts/{id:int}/notes", post_note, methods=["POST"]),
+    Route("/api/v1/contacts/{id:int}/reminders", post_reminder, methods=["POST"]),
+    Route("/api/v1/contacts/{id:int}/relationships", post_rel, methods=["POST"]),
+    Route("/api/v1/activities", activities, methods=["GET", "POST"]),
+    Route("/api/v1/graph", graph),
     Route("/health", health),
 ])
 
@@ -163,6 +221,31 @@ async def main():
             e, t = await call(s, "get_contact", contact_id=99)
             check(e and "NOT_FOUND" in t, "API errors surface as tool errors")
             e, t = await call(s, "create_contact", fields={"firstname": "Zed"}); check(not e and "Zed" in t, "create_contact")
+            # --- regressions found by testing against a real Meerkat
+            e, t = await call(s, "add_note", contact_id=1, content="hi")
+            check(not e and RFC.match(BODIES["note"]["date"]), "add_note defaults a required RFC3339 date")
+            e, t = await call(s, "add_note", contact_id=1, content="hi", date="2026-11-08")
+            check(not e and BODIES["note"]["date"] == "2026-11-08T00:00:00Z", "add_note converts date-only to RFC3339")
+            e, t = await call(s, "log_activity", title="x", date="2026-11-08", contact_ids=[1])
+            check(not e and BODIES["activity"]["date"] == "2026-11-08T00:00:00Z", "log_activity converts date-only to RFC3339")
+            e, t = await call(s, "create_reminder", contact_id=1, message="m", remind_at="2026-11-15")
+            check(not e and BODIES["reminder"]["contact_id"] == 1 and BODIES["reminder"]["recurrence"] == "once"
+                  and BODIES["reminder"]["remind_at"] == "2026-11-15T00:00:00Z",
+                  "create_reminder sends contact_id, recurrence=once and RFC3339 date")
+            e, t = await call(s, "create_reminder", contact_id=1, message="m", remind_at="2026-11-15", recurrence="weekly")
+            check(not e and BODIES["reminder"]["recurrence"] == "weekly", "create_reminder keeps explicit recurrence")
+            e, t = await call(s, "list_activities", date_from="2026-07-01", date_to="2026-07-31")
+            check(not e and json.loads(t)["count"] == 1, "list_activities date range is filtered in the server")
+            e, t = await call(s, "list_activities")
+            check(not e and json.loads(t)["count"] == 3, "list_activities without range returns all")
+            e, t = await call(s, "create_relationship", contact_id=3, related_contact_id=1, relationship_type="Spouse")
+            check(not e and BODIES["rel"]["name"] == "Eva Smith" and BODIES["rel"]["type"] == "Spouse"
+                  and BODIES["rel"]["contact_id"] == 3, "create_relationship uses the related person's name")
+            e, t = await call(s, "network_graph")
+            check(not e and "Eva Smith --Spouse--> Zed" in t and '"nodes"' not in t, "network_graph is compact and readable")
+            check(RFC.match(BODIES["note"]["date"]) is not None, "sanity")
+            e, t = await call(s, "get_contact", contact_id=99)
+            check(e and "details" in t or "NOT_FOUND" in t, "nested Meerkat errors parse")
         await with_session(port, scenario1)
         # non-localhost Host header (as when Obot proxies via a container hostname)
         async def ping(s):
